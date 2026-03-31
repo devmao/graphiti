@@ -16,6 +16,7 @@ limitations under the License.
 
 import json
 import logging
+import re
 import typing
 from typing import Any, ClassVar
 
@@ -32,6 +33,12 @@ from .errors import RateLimitError, RefusalError
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = 'gpt-4.1-mini'
+
+# Regex to strip markdown code fences (```json ... ``` or ``` ... ```)
+_MD_FENCE_RE = re.compile(
+    r'^\s*```(?:json|JSON)?\s*\n?(.*?)\n?\s*```\s*$',
+    re.DOTALL,
+)
 
 
 class OpenAIGenericClient(LLMClient):
@@ -98,7 +105,7 @@ class OpenAIGenericClient(LLMClient):
         response_model: type[BaseModel] | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         model_size: ModelSize = ModelSize.medium,
-    ) -> dict[str, typing.Any]:
+    ) -> tuple[dict[str, typing.Any], int, int]:
         openai_messages: list[ChatCompletionMessageParam] = []
         for m in messages:
             m.content = self._clean_input(m.content)
@@ -127,8 +134,39 @@ class OpenAIGenericClient(LLMClient):
                 max_tokens=self.max_tokens,
                 response_format=response_format,  # type: ignore[arg-type]
             )
-            result = response.choices[0].message.content or ''
-            return json.loads(result)
+
+            # --- diagnostic logging ---
+            raw_content = response.choices[0].message.content if response.choices else None
+            finish_reason = response.choices[0].finish_reason if response.choices else None
+            logger.debug(
+                'LLM response: model=%s, content type=%s, len=%s, '
+                'finish_reason=%s, usage=%s, first 500 chars: %.500r',
+                self.model or DEFAULT_MODEL,
+                type(raw_content).__name__,
+                len(raw_content) if raw_content else 'None',
+                finish_reason,
+                response.usage,
+                raw_content,
+            )
+
+            result = raw_content or ''
+
+            # --- token tracking (Copilot/OpenRouter backends) ---
+            input_tokens = 0
+            output_tokens = 0
+            if response.usage:
+                input_tokens = response.usage.prompt_tokens or 0
+                output_tokens = response.usage.completion_tokens or 0
+
+            # Strip markdown code fences that some models (e.g. Claude via
+            # Copilot) wrap around JSON responses despite json_object format.
+            fence_match = _MD_FENCE_RE.match(result)
+            if fence_match:
+                logger.debug('Stripped markdown code fence from LLM response')
+                result = fence_match.group(1)
+
+            parsed = json.loads(result)
+            return parsed, input_tokens, output_tokens
         except openai.RateLimitError as e:
             raise RateLimitError from e
         except Exception as e:
@@ -166,9 +204,10 @@ class OpenAIGenericClient(LLMClient):
 
             while retry_count <= self.MAX_RETRIES:
                 try:
-                    response = await self._generate_response(
+                    response, input_tokens, output_tokens = await self._generate_response(
                         messages, response_model, max_tokens=max_tokens, model_size=model_size
                     )
+                    self.token_tracker.record(prompt_name or 'unknown', input_tokens, output_tokens)
                     return response
                 except (RateLimitError, RefusalError):
                     # These errors should not trigger retries
