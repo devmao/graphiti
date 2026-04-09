@@ -93,3 +93,31 @@ class TestCodeFenceStripping:
         assert result == {'ok': True}
         assert inp == 42
         assert out == 7
+
+    @pytest.mark.asyncio
+    async def test_arbitrary_language_tag_fence(self):
+        """Fences with non-json language tags (e.g. ```jsonl, ```text) are stripped."""
+        client = _make_client('```jsonl\n{"key": "value"}\n```')
+        result, _, _ = await client._generate_response(MESSAGES)
+        assert result == {'key': 'value'}
+
+    @pytest.mark.asyncio
+    async def test_mixed_case_language_tag(self):
+        """Fences with mixed-case language tags (e.g. ```Json) are stripped."""
+        client = _make_client('```Json\n{"key": "value"}\n```')
+        result, _, _ = await client._generate_response(MESSAGES)
+        assert result == {'key': 'value'}
+
+    @pytest.mark.asyncio
+    async def test_empty_response_raises(self):
+        """An empty LLM response raises ValueError (not JSONDecodeError)."""
+        client = _make_client('')
+        with pytest.raises(ValueError, match='empty response'):
+            await client._generate_response(MESSAGES)
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_response_raises(self):
+        """A whitespace-only LLM response raises ValueError."""
+        client = _make_client('   \n  ')
+        with pytest.raises(ValueError, match='empty response'):
+            await client._generate_response(MESSAGES)

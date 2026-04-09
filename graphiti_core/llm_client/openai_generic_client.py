@@ -34,9 +34,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = 'gpt-4.1-mini'
 
-# Regex to strip markdown code fences (```json ... ``` or ``` ... ```)
+# Regex to strip markdown code fences (```json ... ```, ```JSON ... ```,
+# ```jsonl ... ```, or bare ``` ... ```).  Case-insensitive and accepts any
+# language tag so we catch all variants Claude might produce.
 _MD_FENCE_RE = re.compile(
-    r'^\s*```(?:json|JSON)?\s*\n?(.*?)\n?\s*```\s*$',
+    r'^\s*```\w*\s*\n?(.*?)\n?\s*```\s*$',
     re.DOTALL,
 )
 
@@ -158,19 +160,41 @@ class OpenAIGenericClient(LLMClient):
                 input_tokens = response.usage.prompt_tokens or 0
                 output_tokens = response.usage.completion_tokens or 0
 
+            # Guard against empty/None responses before attempting to parse.
+            if not result.strip():
+                raise ValueError('LLM returned an empty response')
+
             # Strip markdown code fences that some models (e.g. Claude via
             # Copilot) wrap around JSON responses despite json_object format.
             fence_match = _MD_FENCE_RE.match(result)
             if fence_match:
-                logger.debug('Stripped markdown code fence from LLM response')
+                logger.debug(
+                    'Stripped markdown code fence from LLM response (model=%s, len=%d)',
+                    self.model or DEFAULT_MODEL,
+                    len(result),
+                )
                 result = fence_match.group(1)
 
             parsed = json.loads(result)
             return parsed, input_tokens, output_tokens
         except openai.RateLimitError as e:
             raise RateLimitError from e
+        except json.JSONDecodeError as e:
+            # Distinguish JSON parse failures (often code-fence wrapping that
+            # the regex did not catch) from other errors.
+            logger.error(
+                'LLM response is not valid JSON (model=%s, first 200 chars: %.200r): %s',
+                self.model or DEFAULT_MODEL,
+                result,
+                e,
+            )
+            raise
         except Exception as e:
-            logger.error(f'Error in generating LLM response: {e}')
+            logger.error(
+                'Error processing LLM response (model=%s): %s',
+                self.model or DEFAULT_MODEL,
+                e,
+            )
             raise
 
     async def generate_response(
@@ -233,10 +257,19 @@ class OpenAIGenericClient(LLMClient):
 
                     retry_count += 1
 
+                    # Classify the error for clearer logging
+                    err_type = type(e).__name__
+                    if isinstance(e, json.JSONDecodeError):
+                        retry_reason = 'invalid JSON (likely markdown code fence wrapping)'
+                    elif 'validation error' in str(e).lower():
+                        retry_reason = f'schema validation mismatch — {str(e).splitlines()[0]}'
+                    else:
+                        retry_reason = str(e)
+
                     # Construct a detailed error message for the LLM
                     error_context = (
                         f'The previous response attempt was invalid. '
-                        f'Error type: {e.__class__.__name__}. '
+                        f'Error type: {err_type}. '
                         f'Error details: {str(e)}. '
                         f'Please try again with a valid response, ensuring the output matches '
                         f'the expected format and constraints.'
@@ -245,7 +278,11 @@ class OpenAIGenericClient(LLMClient):
                     error_message = Message(role='user', content=error_context)
                     messages.append(error_message)
                     logger.warning(
-                        f'Retrying after application error (attempt {retry_count}/{self.MAX_RETRIES}): {e}'
+                        'Retrying after %s (attempt %d/%d): %s',
+                        retry_reason,
+                        retry_count,
+                        self.MAX_RETRIES,
+                        err_type,
                     )
 
             # If we somehow get here, raise the last error
