@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import json
 import logging
 from typing import Any
 
@@ -32,6 +33,30 @@ from graphiti_core.nodes import EntityNode
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_for_falkordb(data: dict[str, Any]) -> dict[str, Any]:
+    """Ensure all property values are FalkorDB-compatible primitives.
+
+    FalkorDB only supports primitive types (str, int, float, bool, None) or
+    arrays of primitives as property values.  Nested dicts and objects are
+    serialised to JSON strings so the save query doesn't fail with
+    ``ResponseError: Property values can only be of primitive types or arrays
+    of primitive types``.
+    """
+    sanitized: dict[str, Any] = {}
+    for key, value in data.items():
+        if isinstance(value, dict):
+            sanitized[key] = json.dumps(value)
+        elif isinstance(value, list):
+            # Check for non-primitive items in the list.
+            if any(isinstance(item, (dict, list)) for item in value):
+                sanitized[key] = json.dumps(value)
+            else:
+                sanitized[key] = value
+        else:
+            sanitized[key] = value
+    return sanitized
+
+
 class FalkorEntityNodeOperations(EntityNodeOperations):
     async def save(
         self,
@@ -48,6 +73,7 @@ class FalkorEntityNodeOperations(EntityNodeOperations):
             'created_at': node.created_at,
         }
         entity_data.update(node.attributes or {})
+        entity_data = _sanitize_for_falkordb(entity_data)
         labels = ':'.join(list(set(node.labels + ['Entity'])))
 
         query = get_entity_node_save_query(GraphProvider.FALKORDB, labels)
@@ -78,7 +104,7 @@ class FalkorEntityNodeOperations(EntityNodeOperations):
                 'labels': list(set(node.labels + ['Entity'])),
             }
             entity_data.update(node.attributes or {})
-            prepared.append(entity_data)
+            prepared.append(_sanitize_for_falkordb(entity_data))
 
         # FalkorDB returns a list of (query, params) tuples for bulk save
         queries: list[tuple[str, dict[str, Any]]] = get_entity_node_save_bulk_query(  # type: ignore[assignment]
