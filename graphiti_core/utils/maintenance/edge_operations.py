@@ -145,7 +145,14 @@ async def extract_edges(
     )
     all_edges_data = ExtractedEdges(**llm_response).edges
 
-    # Validate entity names
+    # Build a reverse lookup: for each edge type name, which (source, target) label pairs
+    # are valid.  Used below to enforce edge_type_map constraints.
+    _allowed_signatures: dict[str, set[tuple[str, str]]] = {}
+    for (src_label, tgt_label), type_names in edge_type_map.items():
+        for tn in type_names:
+            _allowed_signatures.setdefault(tn, set()).add((src_label, tgt_label))
+
+    # Validate entity names and edge_type_map constraints
     edges_data: list[ExtractedEdge] = []
     for edge_data in all_edges_data:
         source_name = edge_data.source_entity_name
@@ -165,6 +172,24 @@ async def extract_edges(
                 edge_data.relation_type,
             )
             continue
+
+        # Validate edge type is allowed for this (source_label, target_label) pair
+        if _allowed_signatures and edge_data.relation_type in _allowed_signatures:
+            source_labels = name_to_node[source_name].labels + ['Entity']
+            target_labels = name_to_node[target_name].labels + ['Entity']
+            valid_pairs = _allowed_signatures[edge_data.relation_type]
+            if not any((sl, tl) in valid_pairs for sl in source_labels for tl in target_labels):
+                logger.warning(
+                    'Edge type %s not allowed between %s (%s) and %s (%s) per edge_type_map; '
+                    'dropping edge: %s',
+                    edge_data.relation_type,
+                    source_name,
+                    name_to_node[source_name].labels,
+                    target_name,
+                    name_to_node[target_name].labels,
+                    edge_data.fact[:120],
+                )
+                continue
 
         edges_data.append(edge_data)
 
@@ -492,9 +517,7 @@ async def resolve_extracted_edge(
     """
     if len(related_edges) == 0 and len(existing_edges) == 0:
         # Still extract custom attributes even when no dedup/invalidation is needed
-        edge_model = (
-            edge_type_candidates.get(extracted_edge.name) if edge_type_candidates else None
-        )
+        edge_model = edge_type_candidates.get(extracted_edge.name) if edge_type_candidates else None
         if edge_model is not None and len(edge_model.model_fields) != 0:
             edge_attributes_context = {
                 'fact': extracted_edge.fact,
@@ -523,6 +546,31 @@ async def resolve_extracted_edge(
             if episode is not None and episode.uuid not in resolved.episodes:
                 resolved.episodes.append(episode.uuid)
             return resolved, [], []
+
+    # Structural dedup for typed edges: if the extracted edge has a typed name
+    # (present in edge_type_candidates) and an existing edge between the same
+    # endpoints already carries the same type, treat it as a duplicate.
+    # This prevents multiple WORKS_AT, COMMITTED_TO, etc. edges between the
+    # same pair of nodes when the only difference is fact text wording.
+    if edge_type_candidates and extracted_edge.name in edge_type_candidates:
+        for edge in related_edges:
+            if (
+                edge.source_node_uuid == extracted_edge.source_node_uuid
+                and edge.target_node_uuid == extracted_edge.target_node_uuid
+                and edge.name == extracted_edge.name
+            ):
+                logger.info(
+                    'Structural dedup: reusing existing %s edge %s (%s -> %s) '
+                    'instead of creating duplicate with different fact text',
+                    extracted_edge.name,
+                    edge.uuid,
+                    edge.source_node_uuid[:8],
+                    edge.target_node_uuid[:8],
+                )
+                resolved = edge
+                if episode is not None and episode.uuid not in resolved.episodes:
+                    resolved.episodes.append(episode.uuid)
+                return resolved, [], []
 
     start = time()
 
