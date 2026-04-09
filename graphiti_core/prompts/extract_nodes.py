@@ -16,7 +16,7 @@ limitations under the License.
 
 from typing import Any, Protocol, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS
 
@@ -34,7 +34,13 @@ class ExtractedEntity(BaseModel):
 
 
 class ExtractedEntities(BaseModel):
-    extracted_entities: list[ExtractedEntity] = Field(..., description='List of extracted entities')
+    model_config = ConfigDict(populate_by_name=True)
+
+    extracted_entities: list[ExtractedEntity] = Field(
+        ...,
+        description='List of extracted entities',
+        validation_alias=AliasChoices('extracted_entities', 'entities'),
+    )
 
 
 class EntitySummary(BaseModel):
