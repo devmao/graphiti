@@ -596,24 +596,29 @@ async def node_search(
                         reranker_min_score,
                     )
             elif config.reranker == NodeReranker.cross_encoder:
-                name_to_uuid_map = {node.name: node.uuid for node in list(node_uuid_map.values())}
+                # Build name -> list[uuid] map to handle nodes that share a name.
+                # With entity name evolution, two nodes could temporarily end up with
+                # the same name during a dedup cycle.  A plain dict would silently
+                # drop one of the UUIDs.
+                name_to_uuids_map: dict[str, list[str]] = {}
+                for node in node_uuid_map.values():
+                    name_to_uuids_map.setdefault(node.name, []).append(node.uuid)
 
                 with _trace_phase(
                     search_tracer,
                     'search.node_search.cross_encoder_rank',
-                    {'candidate_count': len(name_to_uuid_map)},
+                    {'candidate_count': len(name_to_uuids_map)},
                 ):
                     reranked_node_names = await cross_encoder.rank(
-                        query, list(name_to_uuid_map.keys())
+                        query, list(name_to_uuids_map.keys())
                     )
-                reranked_uuids = [
-                    name_to_uuid_map[name]
-                    for name, score in reranked_node_names
-                    if score >= reranker_min_score
-                ]
-                node_scores = [
-                    score for _, score in reranked_node_names if score >= reranker_min_score
-                ]
+                reranked_uuids = []
+                node_scores = []
+                for name, score in reranked_node_names:
+                    if score >= reranker_min_score:
+                        for uuid in name_to_uuids_map[name]:
+                            reranked_uuids.append(uuid)
+                            node_scores.append(score)
             elif config.reranker == NodeReranker.episode_mentions:
                 with _trace_phase(
                     search_tracer,
