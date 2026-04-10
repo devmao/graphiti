@@ -380,6 +380,27 @@ async def _resolve_with_llm(
             resolved_node = extracted_node
         elif duplicate_name in existing_nodes_by_name:
             resolved_node = existing_nodes_by_name[duplicate_name]
+            # Apply the LLM's recommended "best name" if it differs from the
+            # existing node's name.  The dedup prompt asks the LLM to return
+            # "the best full name for the entity (preserve the original name
+            # unless a duplicate has a more complete name)".  Until now this
+            # field was silently discarded, causing the first-seen name to
+            # persist forever even when later episodes provide a more accurate
+            # or complete variant.
+            best_name: str = resolution.name.strip() if resolution.name else ''
+            if best_name and best_name != resolved_node.name:
+                old_name = resolved_node.name
+                # Update the lookup dict so subsequent resolutions in the same
+                # batch see the new name and can match against it.
+                del existing_nodes_by_name[old_name]
+                resolved_node.name = best_name
+                existing_nodes_by_name[best_name] = resolved_node
+                logger.info(
+                    'Entity name evolved: %r -> %r (uuid=%s)',
+                    old_name,
+                    best_name,
+                    resolved_node.uuid,
+                )
         else:
             logger.warning(
                 'Invalid duplicate_name for extracted node %s; treating as no duplicate. '
