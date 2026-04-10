@@ -26,6 +26,7 @@ from graphiti_core.utils.maintenance.dedup_helpers import (
 from graphiti_core.utils.maintenance.node_operations import (
     _collect_candidate_nodes,
     _extract_entity_summaries_batch,
+    _is_name_upgrade,
     _resolve_with_llm,
     extract_attributes_from_nodes,
     resolve_extracted_nodes,
@@ -922,13 +923,11 @@ async def test_batch_summaries_calls_llm_for_long_summary():
 
 @pytest.mark.asyncio
 async def test_resolve_with_llm_applies_best_name(monkeypatch):
-    """When the LLM suggests a better name for a duplicate entity, the resolved node's name
-    should be updated to the LLM's recommendation."""
-    existing = EntityNode(
-        name='Budget Pending Procurement Approval', group_id='group', labels=['Entity']
-    )
+    """When the LLM suggests a strict-superset name for a duplicate entity, the
+    resolved node's name should be updated to the LLM's recommendation."""
+    existing = EntityNode(name='Budget Pending', group_id='group', labels=['Entity'])
     extracted = EntityNode(
-        name='Budget pending on POC results', group_id='group', labels=['Entity']
+        name='Budget Pending Procurement Approval', group_id='group', labels=['Entity']
     )
 
     indexes = _build_candidate_indexes([existing])
@@ -945,8 +944,8 @@ async def test_resolve_with_llm_applies_best_name(monkeypatch):
             'entity_resolutions': [
                 {
                     'id': 0,
-                    'name': 'Budget Pending on POC Results',
-                    'duplicate_name': 'Budget Pending Procurement Approval',
+                    'name': 'Budget Pending Procurement Approval',
+                    'duplicate_candidate_id': 0,
                 }
             ]
         }
@@ -963,59 +962,237 @@ async def test_resolve_with_llm_applies_best_name(monkeypatch):
     )
 
     assert state.resolved_nodes[0].uuid == existing.uuid
-    assert state.resolved_nodes[0].name == 'Budget Pending on POC Results'
+    assert state.resolved_nodes[0].name == 'Budget Pending Procurement Approval'
     assert state.uuid_map[extracted.uuid] == existing.uuid
     assert state.duplicate_pairs == [(extracted, existing)]
 
 
+# ---------------------------------------------------------------------------
+# _is_name_upgrade tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsNameUpgrade:
+    """Tests for the name-upgrade-only guard that prevents name flapping.
+
+    The guard uses a strict-superset policy: the proposed name must contain ALL
+    significant tokens from the existing name (case-insensitive).  It may add new
+    tokens, but it must not lose any.  Pure case/whitespace changes are also allowed.
+    """
+
+    def test_rejects_shorter_name(self):
+        """'Federal Audit' -> 'Audit' is a downgrade (loses 'federal')."""
+        assert _is_name_upgrade('Federal Audit', 'Audit') is False
+
+    def test_rejects_much_shorter_name(self):
+        """'SecureData Implementation' -> 'SecureData' loses 'implementation'."""
+        assert _is_name_upgrade('SecureData Implementation', 'SecureData') is False
+
+    def test_accepts_longer_more_complete_name(self):
+        """'Budget Pending' -> 'Budget Pending Procurement Approval' is a superset."""
+        assert _is_name_upgrade('Budget Pending', 'Budget Pending Procurement Approval') is True
+
+    def test_rejects_semantic_drift(self):
+        """'Budget Pending Procurement Approval' -> 'Budget Pending on POC Results'
+        loses 'procurement' and 'approval' -- semantic drift, not an upgrade."""
+        assert (
+            _is_name_upgrade('Budget Pending Procurement Approval', 'Budget Pending on POC Results')
+            is False
+        )
+
+    def test_rejects_completely_different_name(self):
+        """'Budget pending on POC' -> 'Demands 20% discount or wait' shares no
+        meaningful tokens -- this is a name hijack, not an upgrade."""
+        assert _is_name_upgrade('Budget pending on POC', 'Demands 20% discount or wait') is False
+
+    def test_accepts_case_normalization(self):
+        """'budget pending' -> 'Budget Pending' is fine (just case change)."""
+        assert _is_name_upgrade('budget pending', 'Budget Pending') is True
+
+    def test_accepts_minor_rewording_all_tokens_preserved(self):
+        """'48-hour fix via Custom Patch' -> '48-Hour Custom Patch Fix' -- all
+        significant tokens preserved, just reordered."""
+        assert _is_name_upgrade('48-hour fix via Custom Patch', '48-Hour Custom Patch Fix') is True
+
+    def test_rejects_low_overlap_same_length(self):
+        """'Start POC tomorrow' -> 'Contract signed today' -- completely different."""
+        assert _is_name_upgrade('Start POC tomorrow', 'Contract signed today') is False
+
+    def test_accepts_identical_name(self):
+        """Same name should be treated as valid (no-op in practice)."""
+        assert _is_name_upgrade('Federal Audit', 'Federal Audit') is True
+
+    def test_accepts_strict_superset(self):
+        """'POC Start' -> 'POC Start Tomorrow' adds a token without losing any."""
+        assert _is_name_upgrade('POC Start', 'POC Start Tomorrow') is True
+
+    def test_rejects_single_word_to_different_single_word(self):
+        """'Audit' -> 'Budget' shares nothing."""
+        assert _is_name_upgrade('Audit', 'Budget') is False
+
+    def test_rejects_date_prefix_drift(self):
+        """'Federal Audit' -> 'February 12th Audit Deadline' loses 'federal'."""
+        assert _is_name_upgrade('Federal Audit', 'February 12th Audit Deadline') is False
+
+    def test_rejects_emphasis_shift(self):
+        """'48-hour fix via Custom Patch' -> 'Legacy DB Custom Patch Development'
+        loses '48', 'hour', 'fix'."""
+        assert (
+            _is_name_upgrade('48-hour fix via Custom Patch', 'Legacy DB Custom Patch Development')
+            is False
+        )
+
+    def test_accepts_qualifier_addition(self):
+        """'Federal Audit' -> 'Federal Compliance Audit' adds a token, keeps all."""
+        assert _is_name_upgrade('Federal Audit', 'Federal Compliance Audit') is True
+
+    def test_accepts_short_to_full_person_name(self):
+        """'Joe' -> 'Joe Michaels' is the classic superset upgrade."""
+        assert _is_name_upgrade('Joe', 'Joe Michaels') is True
+
+    def test_rejects_person_name_swap(self):
+        """'Joe Michaels' -> 'Jane Michaels' loses 'joe'."""
+        assert _is_name_upgrade('Joe Michaels', 'Jane Michaels') is False
+
+
+class TestResolveWithLlmNameGuard:
+    """Integration tests for the name-upgrade guard within _resolve_with_llm."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_downgrade_name(self, monkeypatch):
+        """When the LLM suggests a shorter/worse name, the existing name is preserved."""
+        existing = EntityNode(name='Federal Audit', group_id='group', labels=['Entity'])
+        extracted = EntityNode(name='Audit', group_id='group', labels=['Entity'])
+
+        indexes = _build_candidate_indexes([existing])
+        state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[0])
+
+        monkeypatch.setattr(
+            'graphiti_core.utils.maintenance.node_operations.prompt_library.dedupe_nodes.nodes',
+            lambda context: ['prompt'],
+        )
+
+        llm_client = MagicMock()
+        llm_client.generate_response = AsyncMock(
+            return_value={
+                'entity_resolutions': [
+                    {
+                        'id': 0,
+                        'name': 'Audit',  # LLM suggests shorter name
+                        'duplicate_candidate_id': 0,
+                    }
+                ]
+            }
+        )
+
+        await _resolve_with_llm(
+            llm_client,
+            [extracted],
+            indexes,
+            state,
+            episode=_make_episode(),
+            previous_episodes=[],
+            entity_types=None,
+        )
+
+        # Should merge to existing node but KEEP the existing name
+        assert state.resolved_nodes[0].uuid == existing.uuid
+        assert state.resolved_nodes[0].name == 'Federal Audit'
+
+    @pytest.mark.asyncio
+    async def test_accepts_upgrade_name(self, monkeypatch):
+        """When the LLM suggests a longer/better name, the name is updated."""
+        existing = EntityNode(name='Budget Pending', group_id='group', labels=['Entity'])
+        extracted = EntityNode(
+            name='Budget Pending Procurement Approval', group_id='group', labels=['Entity']
+        )
+
+        indexes = _build_candidate_indexes([existing])
+        state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[0])
+
+        monkeypatch.setattr(
+            'graphiti_core.utils.maintenance.node_operations.prompt_library.dedupe_nodes.nodes',
+            lambda context: ['prompt'],
+        )
+
+        llm_client = MagicMock()
+        llm_client.generate_response = AsyncMock(
+            return_value={
+                'entity_resolutions': [
+                    {
+                        'id': 0,
+                        'name': 'Budget Pending Procurement Approval',
+                        'duplicate_candidate_id': 0,
+                    }
+                ]
+            }
+        )
+
+        await _resolve_with_llm(
+            llm_client,
+            [extracted],
+            indexes,
+            state,
+            episode=_make_episode(),
+            previous_episodes=[],
+            entity_types=None,
+        )
+
+        # Name should be updated to the more complete version
+        assert state.resolved_nodes[0].uuid == existing.uuid
+        assert state.resolved_nodes[0].name == 'Budget Pending Procurement Approval'
+
+    @pytest.mark.asyncio
+    async def test_rejects_unrelated_name(self, monkeypatch):
+        """When the LLM suggests a completely different name (name hijack), preserve existing."""
+        existing = EntityNode(name='Budget pending on POC', group_id='group', labels=['Entity'])
+        extracted = EntityNode(
+            name='Demands 20% discount or wait', group_id='group', labels=['Entity']
+        )
+
+        indexes = _build_candidate_indexes([existing])
+        state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[0])
+
+        monkeypatch.setattr(
+            'graphiti_core.utils.maintenance.node_operations.prompt_library.dedupe_nodes.nodes',
+            lambda context: ['prompt'],
+        )
+
+        llm_client = MagicMock()
+        llm_client.generate_response = AsyncMock(
+            return_value={
+                'entity_resolutions': [
+                    {
+                        'id': 0,
+                        'name': 'Demands 20% discount or wait',
+                        'duplicate_candidate_id': 0,
+                    }
+                ]
+            }
+        )
+
+        await _resolve_with_llm(
+            llm_client,
+            [extracted],
+            indexes,
+            state,
+            episode=_make_episode(),
+            previous_episodes=[],
+            entity_types=None,
+        )
+
+        # Should merge but keep the existing name
+        assert state.resolved_nodes[0].uuid == existing.uuid
+        assert state.resolved_nodes[0].name == 'Budget pending on POC'
+
+
 @pytest.mark.asyncio
-async def test_resolve_with_llm_preserves_name_when_unchanged(monkeypatch):
-    """When the LLM returns the same name as the existing node, the name should not change."""
-    existing = EntityNode(name='Dizzy Gillespie', group_id='group', labels=['Entity'])
-    extracted = EntityNode(name='Dizzy', group_id='group', labels=['Entity'])
-
-    indexes = _build_candidate_indexes([existing])
-    state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[0])
-
-    monkeypatch.setattr(
-        'graphiti_core.utils.maintenance.node_operations.prompt_library.dedupe_nodes.nodes',
-        lambda context: ['prompt'],
-    )
-
-    llm_client = MagicMock()
-    llm_client.generate_response = AsyncMock(
-        return_value={
-            'entity_resolutions': [
-                {
-                    'id': 0,
-                    'name': 'Dizzy Gillespie',
-                    'duplicate_name': 'Dizzy Gillespie',
-                }
-            ]
-        }
-    )
-
-    await _resolve_with_llm(
-        llm_client,
-        [extracted],
-        indexes,
-        state,
-        episode=_make_episode(),
-        previous_episodes=[],
-        entity_types=None,
-    )
-
-    assert state.resolved_nodes[0].uuid == existing.uuid
-    assert state.resolved_nodes[0].name == 'Dizzy Gillespie'
-
-
-@pytest.mark.asyncio
-async def test_resolve_with_llm_updates_name_lookup_dict(monkeypatch):
-    """After a name update, the existing_nodes_by_name dict should reflect the new name
-    so that subsequent resolutions in the same batch see the updated name."""
-    existing = EntityNode(name='Old Name Here', group_id='group', labels=['Entity'])
-    extracted1 = EntityNode(name='Better Name Here', group_id='group', labels=['Entity'])
-    extracted2 = EntityNode(name='Better Name Here Too', group_id='group', labels=['Entity'])
+async def test_resolve_with_llm_batch_name_evolution(monkeypatch):
+    """When multiple extracted nodes resolve to the same existing node, name evolution
+    applies to the shared candidate object so subsequent resolutions see the updated name."""
+    existing = EntityNode(name='Project Alpha', group_id='group', labels=['Entity'])
+    extracted1 = EntityNode(name='Project Alpha Phase Two', group_id='group', labels=['Entity'])
+    extracted2 = EntityNode(name='Alpha Phase Two Ref', group_id='group', labels=['Entity'])
 
     indexes = _build_candidate_indexes([existing])
     state = DedupResolutionState(
@@ -1033,13 +1210,13 @@ async def test_resolve_with_llm_updates_name_lookup_dict(monkeypatch):
             'entity_resolutions': [
                 {
                     'id': 0,
-                    'name': 'Best Name',
-                    'duplicate_name': 'Old Name Here',
+                    'name': 'Project Alpha Phase Two',
+                    'duplicate_candidate_id': 0,
                 },
                 {
                     'id': 1,
-                    'name': 'Best Name',
-                    'duplicate_name': 'Best Name',
+                    'name': 'Project Alpha Phase Two',
+                    'duplicate_candidate_id': 0,
                 },
             ]
         }
@@ -1057,7 +1234,7 @@ async def test_resolve_with_llm_updates_name_lookup_dict(monkeypatch):
 
     assert state.resolved_nodes[0].uuid == existing.uuid
     assert state.resolved_nodes[1].uuid == existing.uuid
-    assert state.resolved_nodes[0].name == 'Best Name'
+    assert state.resolved_nodes[0].name == 'Project Alpha Phase Two'
 
 
 @pytest.mark.asyncio
@@ -1081,7 +1258,7 @@ async def test_resolve_with_llm_ignores_empty_best_name(monkeypatch):
                 {
                     'id': 0,
                     'name': '  ',
-                    'duplicate_name': 'Dizzy Gillespie',
+                    'duplicate_candidate_id': 0,
                 }
             ]
         }
