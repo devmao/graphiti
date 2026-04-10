@@ -918,3 +918,184 @@ async def test_batch_summaries_calls_llm_for_long_summary():
     # LLM should have been called to condense the long summary
     llm_client.generate_response.assert_awaited_once()
     assert node.summary == 'Condensed summary'
+
+
+@pytest.mark.asyncio
+async def test_resolve_with_llm_applies_best_name(monkeypatch):
+    """When the LLM suggests a better name for a duplicate entity, the resolved node's name
+    should be updated to the LLM's recommendation."""
+    existing = EntityNode(
+        name='Budget Pending Procurement Approval', group_id='group', labels=['Entity']
+    )
+    extracted = EntityNode(
+        name='Budget pending on POC results', group_id='group', labels=['Entity']
+    )
+
+    indexes = _build_candidate_indexes([existing])
+    state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[0])
+
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations.prompt_library.dedupe_nodes.nodes',
+        lambda context: ['prompt'],
+    )
+
+    llm_client = MagicMock()
+    llm_client.generate_response = AsyncMock(
+        return_value={
+            'entity_resolutions': [
+                {
+                    'id': 0,
+                    'name': 'Budget Pending on POC Results',
+                    'duplicate_name': 'Budget Pending Procurement Approval',
+                }
+            ]
+        }
+    )
+
+    await _resolve_with_llm(
+        llm_client,
+        [extracted],
+        indexes,
+        state,
+        episode=_make_episode(),
+        previous_episodes=[],
+        entity_types=None,
+    )
+
+    assert state.resolved_nodes[0].uuid == existing.uuid
+    assert state.resolved_nodes[0].name == 'Budget Pending on POC Results'
+    assert state.uuid_map[extracted.uuid] == existing.uuid
+    assert state.duplicate_pairs == [(extracted, existing)]
+
+
+@pytest.mark.asyncio
+async def test_resolve_with_llm_preserves_name_when_unchanged(monkeypatch):
+    """When the LLM returns the same name as the existing node, the name should not change."""
+    existing = EntityNode(name='Dizzy Gillespie', group_id='group', labels=['Entity'])
+    extracted = EntityNode(name='Dizzy', group_id='group', labels=['Entity'])
+
+    indexes = _build_candidate_indexes([existing])
+    state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[0])
+
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations.prompt_library.dedupe_nodes.nodes',
+        lambda context: ['prompt'],
+    )
+
+    llm_client = MagicMock()
+    llm_client.generate_response = AsyncMock(
+        return_value={
+            'entity_resolutions': [
+                {
+                    'id': 0,
+                    'name': 'Dizzy Gillespie',
+                    'duplicate_name': 'Dizzy Gillespie',
+                }
+            ]
+        }
+    )
+
+    await _resolve_with_llm(
+        llm_client,
+        [extracted],
+        indexes,
+        state,
+        episode=_make_episode(),
+        previous_episodes=[],
+        entity_types=None,
+    )
+
+    assert state.resolved_nodes[0].uuid == existing.uuid
+    assert state.resolved_nodes[0].name == 'Dizzy Gillespie'
+
+
+@pytest.mark.asyncio
+async def test_resolve_with_llm_updates_name_lookup_dict(monkeypatch):
+    """After a name update, the existing_nodes_by_name dict should reflect the new name
+    so that subsequent resolutions in the same batch see the updated name."""
+    existing = EntityNode(name='Old Name Here', group_id='group', labels=['Entity'])
+    extracted1 = EntityNode(name='Better Name Here', group_id='group', labels=['Entity'])
+    extracted2 = EntityNode(name='Better Name Here Too', group_id='group', labels=['Entity'])
+
+    indexes = _build_candidate_indexes([existing])
+    state = DedupResolutionState(
+        resolved_nodes=[None, None], uuid_map={}, unresolved_indices=[0, 1]
+    )
+
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations.prompt_library.dedupe_nodes.nodes',
+        lambda context: ['prompt'],
+    )
+
+    llm_client = MagicMock()
+    llm_client.generate_response = AsyncMock(
+        return_value={
+            'entity_resolutions': [
+                {
+                    'id': 0,
+                    'name': 'Best Name',
+                    'duplicate_name': 'Old Name Here',
+                },
+                {
+                    'id': 1,
+                    'name': 'Best Name',
+                    'duplicate_name': 'Best Name',
+                },
+            ]
+        }
+    )
+
+    await _resolve_with_llm(
+        llm_client,
+        [extracted1, extracted2],
+        indexes,
+        state,
+        episode=_make_episode(),
+        previous_episodes=[],
+        entity_types=None,
+    )
+
+    assert state.resolved_nodes[0].uuid == existing.uuid
+    assert state.resolved_nodes[1].uuid == existing.uuid
+    assert state.resolved_nodes[0].name == 'Best Name'
+
+
+@pytest.mark.asyncio
+async def test_resolve_with_llm_ignores_empty_best_name(monkeypatch):
+    """If the LLM returns an empty or whitespace-only name, the existing name is preserved."""
+    existing = EntityNode(name='Dizzy Gillespie', group_id='group', labels=['Entity'])
+    extracted = EntityNode(name='Dizzy', group_id='group', labels=['Entity'])
+
+    indexes = _build_candidate_indexes([existing])
+    state = DedupResolutionState(resolved_nodes=[None], uuid_map={}, unresolved_indices=[0])
+
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.node_operations.prompt_library.dedupe_nodes.nodes',
+        lambda context: ['prompt'],
+    )
+
+    llm_client = MagicMock()
+    llm_client.generate_response = AsyncMock(
+        return_value={
+            'entity_resolutions': [
+                {
+                    'id': 0,
+                    'name': '  ',
+                    'duplicate_name': 'Dizzy Gillespie',
+                }
+            ]
+        }
+    )
+
+    await _resolve_with_llm(
+        llm_client,
+        [extracted],
+        indexes,
+        state,
+        episode=_make_episode(),
+        previous_episodes=[],
+        entity_types=None,
+    )
+
+    assert state.resolved_nodes[0].uuid == existing.uuid
+    assert state.resolved_nodes[0].name == 'Dizzy Gillespie'
