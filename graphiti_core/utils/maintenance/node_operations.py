@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from time import time
 from typing import Any
@@ -241,6 +242,80 @@ async def _collect_candidate_nodes(
     return ordered_candidates
 
 
+# Stop-words excluded from token-overlap calculations.  These are common
+# English function words that carry little semantic weight and would inflate
+# overlap scores between unrelated names.
+_NAME_STOP_WORDS: frozenset[str] = frozenset(
+    {
+        'a',
+        'an',
+        'the',
+        'of',
+        'in',
+        'on',
+        'at',
+        'to',
+        'for',
+        'by',
+        'is',
+        'or',
+        'and',
+        'via',
+        'with',
+        'from',
+        'as',
+        'if',
+        'its',
+        'but',
+    }
+)
+
+# Regex for splitting a name into tokens (word-boundary split, lowercase).
+_TOKEN_RE = re.compile(r'[a-z0-9]+', re.IGNORECASE)
+
+
+def _is_name_upgrade(existing_name: str, proposed_name: str) -> bool:
+    """Determine whether *proposed_name* is a valid "upgrade" over *existing_name*.
+
+    The guard prevents **name flapping** — the problem where an LLM dedup
+    prompt suggests shorter, vaguer, or semantically unrelated names that
+    replace better existing names across episodes.
+
+    Policy — **strict superset or case-only change**:
+
+    1. Identical (case-insensitive) → always accept (no-op).
+    2. The proposed name must contain **every** significant token from the
+       existing name (case-insensitive).  It may add new tokens but must not
+       lose any.  Stop-words (a, the, of, via, …) are excluded from the
+       check.
+
+    This means:
+    - ``Joe`` → ``Joe Michaels`` — accepted (superset)
+    - ``Federal Audit`` → ``Federal Compliance Audit`` — accepted (superset)
+    - ``Federal Audit`` → ``February 12th Audit Deadline`` — rejected (lost "federal")
+    - ``48-hour fix via Custom Patch`` → ``Legacy DB Custom Patch Development``
+      — rejected (lost "48", "hour", "fix")
+
+    Returns ``True`` if the rename should be applied, ``False`` otherwise.
+    """
+    if existing_name.strip().lower() == proposed_name.strip().lower():
+        return True
+
+    existing_tokens = {
+        t.lower() for t in _TOKEN_RE.findall(existing_name) if t.lower() not in _NAME_STOP_WORDS
+    }
+    proposed_tokens = {
+        t.lower() for t in _TOKEN_RE.findall(proposed_name) if t.lower() not in _NAME_STOP_WORDS
+    }
+
+    if not existing_tokens:
+        # Edge case: existing name is all stop-words.  Allow change.
+        return True
+
+    # Strict superset: every existing token must appear in the proposed name.
+    return existing_tokens <= proposed_tokens
+
+
 async def _resolve_with_llm(
     llm_client: LLMClient,
     extracted_nodes: list[EntityNode],
@@ -389,18 +464,26 @@ async def _resolve_with_llm(
             # or complete variant.
             best_name: str = resolution.name.strip() if resolution.name else ''
             if best_name and best_name != resolved_node.name:
-                old_name = resolved_node.name
-                # Update the lookup dict so subsequent resolutions in the same
-                # batch see the new name and can match against it.
-                del existing_nodes_by_name[old_name]
-                resolved_node.name = best_name
-                existing_nodes_by_name[best_name] = resolved_node
-                logger.info(
-                    'Entity name evolved: %r -> %r (uuid=%s)',
-                    old_name,
-                    best_name,
-                    resolved_node.uuid,
-                )
+                if _is_name_upgrade(resolved_node.name, best_name):
+                    old_name = resolved_node.name
+                    # Update the lookup dict so subsequent resolutions in the same
+                    # batch see the new name and can match against it.
+                    del existing_nodes_by_name[old_name]
+                    resolved_node.name = best_name
+                    existing_nodes_by_name[best_name] = resolved_node
+                    logger.info(
+                        'Entity name evolved: %r -> %r (uuid=%s)',
+                        old_name,
+                        best_name,
+                        resolved_node.uuid,
+                    )
+                else:
+                    logger.info(
+                        'Entity name change rejected (not an upgrade): %r -> %r (uuid=%s)',
+                        resolved_node.name,
+                        best_name,
+                        resolved_node.uuid,
+                    )
         else:
             logger.warning(
                 'Invalid duplicate_name for extracted node %s; treating as no duplicate. '
