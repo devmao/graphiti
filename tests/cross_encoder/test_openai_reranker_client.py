@@ -48,6 +48,26 @@ def _make_response_no_logprobs() -> MagicMock:
     return response
 
 
+def _make_response_empty_choices() -> MagicMock:
+    """Build a mock response with an empty ``choices`` list.
+
+    Some providers (notably the GitHub Copilot proxy when routing Claude models)
+    intermittently return 200 OK with no choices — usually under concurrent load
+    with ``logit_bias`` + ``logprobs`` + ``max_tokens=1``. Previously this
+    raised ``IndexError`` and crashed the entire rerank batch.
+    """
+    response = MagicMock()
+    response.choices = []
+    return response
+
+
+def _make_response_empty_logprobs_content() -> MagicMock:
+    """Build a mock response where logprobs exists but content is None/empty."""
+    response = MagicMock()
+    response.choices[0].logprobs.content = None
+    return response
+
+
 @pytest.fixture
 def client():
     config = LLMConfig(api_key='test-key', model='gpt-4.1-nano')
@@ -130,6 +150,57 @@ class TestOpenAIRerankerClientRank:
     async def test_rank_empty_passages(self, client):
         result = await client.rank('query', [])
         assert result == []
+
+    @pytest.mark.asyncio
+    async def test_rank_empty_choices_appends_zero(self, client):
+        """When a response has empty ``choices``, score 0.0 is appended.
+
+        Regression test for the bug where the GitHub Copilot proxy
+        (and other providers under concurrent load with ``logit_bias`` +
+        ``logprobs`` + ``max_tokens=1``) returned 200 OK with no choices,
+        causing ``response.choices[0]`` to raise IndexError and crash the
+        entire rerank batch — and therefore the entire search.
+        """
+        logprob = math.log(0.9)
+        client.client.chat.completions.create.side_effect = [
+            _make_response([_make_logprob_entry('True', logprob)]),
+            _make_response_empty_choices(),
+            _make_response([_make_logprob_entry('True', logprob)]),
+        ]
+
+        result = await client.rank('query', ['p1', 'p2', 'p3'])
+
+        assert len(result) == 3
+        scores = {passage: score for passage, score in result}
+        assert scores['p2'] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_rank_empty_logprobs_content_appends_zero(self, client):
+        """When ``logprobs.content`` is None, score 0.0 is appended."""
+        logprob = math.log(0.9)
+        client.client.chat.completions.create.side_effect = [
+            _make_response([_make_logprob_entry('True', logprob)]),
+            _make_response_empty_logprobs_content(),
+        ]
+
+        result = await client.rank('query', ['p1', 'p2'])
+
+        assert len(result) == 2
+        scores = {passage: score for passage, score in result}
+        assert scores['p2'] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_rank_all_empty_choices_no_exception(self, client):
+        """All responses with empty choices → all scores 0.0, no exception."""
+        client.client.chat.completions.create.side_effect = [
+            _make_response_empty_choices(),
+            _make_response_empty_choices(),
+        ]
+
+        result = await client.rank('query', ['a', 'b'])
+
+        assert len(result) == 2
+        assert all(score == 0.0 for _, score in result)
 
     @pytest.mark.asyncio
     async def test_rank_rate_limit_error_is_reraised(self, client):

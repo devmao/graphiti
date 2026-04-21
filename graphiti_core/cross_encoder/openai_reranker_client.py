@@ -96,13 +96,26 @@ class OpenAIRerankerClient(CrossEncoderClient):
                 ]
             )
 
-            responses_top_logprobs = [
-                response.choices[0].logprobs.content[0].top_logprobs
-                if response.choices[0].logprobs is not None
-                and response.choices[0].logprobs.content is not None
-                else []
-                for response in responses
-            ]
+            # Defensive extraction: some providers (e.g. GitHub Copilot proxy
+            # routing Claude models) intermittently return responses with an
+            # empty ``choices`` list, ``logprobs=None``, or empty
+            # ``logprobs.content`` — especially under concurrent load with
+            # ``logit_bias`` + ``logprobs`` + ``max_tokens=1``. Any of these
+            # would raise IndexError under the previous list-comprehension and
+            # tank the entire rerank batch (and therefore the search). Treat
+            # each as "no signal" → empty top_logprobs → score 0.0 below.
+            responses_top_logprobs: list[list] = []
+            for response in responses:
+                choices = getattr(response, 'choices', None) or []
+                if not choices:
+                    responses_top_logprobs.append([])
+                    continue
+                logprobs = getattr(choices[0], 'logprobs', None)
+                content = getattr(logprobs, 'content', None) if logprobs is not None else None
+                if not content:
+                    responses_top_logprobs.append([])
+                    continue
+                responses_top_logprobs.append(getattr(content[0], 'top_logprobs', []) or [])
             scores: list[float] = []
             for top_logprobs in responses_top_logprobs:
                 if len(top_logprobs) == 0:
