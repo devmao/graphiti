@@ -43,6 +43,60 @@ _MD_FENCE_RE = re.compile(
 )
 
 
+def _extract_first_json_value(text: str) -> str | None:
+    """Find the first complete top-level JSON object or array in `text`.
+
+    Walks the string char-by-char tracking brace/bracket depth, with
+    string-literal awareness (so braces inside `"..."` strings do not
+    affect depth). Returns the substring of the first balanced
+    {...} or [...], or None if no complete JSON value is found.
+
+    Recovers responses where Claude emits valid JSON followed by
+    reasoning prose like `{...}\\n\\nWait, let me reconsider...`,
+    which Anthropic models do despite `response_format: json_object`
+    when JSON-schema enforcement is downgraded (e.g. via the GitHub
+    Copilot proxy path).
+    """
+    s = text.strip()
+    if not s:
+        return None
+    start_chars = {'{': '}', '[': ']'}
+    start = -1
+    open_char = ''
+    for i, c in enumerate(s):
+        if c in start_chars:
+            start = i
+            open_char = c
+            break
+    if start == -1:
+        return None
+    close_char = start_chars[open_char]
+
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif c == '\\':
+                escape = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+            continue
+        if c == open_char:
+            depth += 1
+        elif c == close_char:
+            depth -= 1
+            if depth == 0:
+                return s[start : i + 1]
+    return None
+
+
 class OpenAIGenericClient(LLMClient):
     """
     OpenAIClient is a client class for interacting with OpenAI's language models.
@@ -180,8 +234,22 @@ class OpenAIGenericClient(LLMClient):
         except openai.RateLimitError as e:
             raise RateLimitError from e
         except json.JSONDecodeError as e:
-            # Distinguish JSON parse failures (often code-fence wrapping that
-            # the regex did not catch) from other errors.
+            extracted = _extract_first_json_value(result)
+            if extracted is not None:
+                try:
+                    parsed = json.loads(extracted)
+                except json.JSONDecodeError:
+                    extracted = None
+                else:
+                    logger.warning(
+                        'Recovered JSON via prefix-extraction fallback '
+                        '(model=%s, raw_len=%d, extracted_len=%d). '
+                        'Indicates schema enforcement is downgraded.',
+                        self.model or DEFAULT_MODEL,
+                        len(result),
+                        len(extracted),
+                    )
+                    return parsed, input_tokens, output_tokens
             logger.error(
                 'LLM response is not valid JSON (model=%s, first 200 chars: %.200r): %s',
                 self.model or DEFAULT_MODEL,
