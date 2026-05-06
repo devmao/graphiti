@@ -41,6 +41,7 @@ from graphiti_core.models.nodes.node_db_queries import (
     get_episode_node_save_bulk_query,
 )
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
+from graphiti_core.driver.falkordb.operations.entity_node_ops import _sanitize_for_falkordb
 from graphiti_core.utils.datetime_utils import convert_datetimes_to_strings
 from graphiti_core.utils.maintenance.dedup_helpers import (
     DedupResolutionState,
@@ -183,6 +184,7 @@ async def add_nodes_and_edges_bulk_tx(
             entity_data['attributes'] = json.dumps(attributes)
         else:
             entity_data.update(node.attributes or {})
+            entity_data = _sanitize_for_falkordb(entity_data)
 
         nodes.append(entity_data)
 
@@ -210,6 +212,7 @@ async def add_nodes_and_edges_bulk_tx(
             edge_data['attributes'] = json.dumps(attributes)
         else:
             edge_data.update(edge.attributes or {})
+            edge_data = _sanitize_for_falkordb(edge_data)
 
         edges.append(edge_data)
 

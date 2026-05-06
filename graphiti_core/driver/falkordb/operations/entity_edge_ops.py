@@ -22,6 +22,7 @@ from graphiti_core.driver.operations.entity_edge_ops import EntityEdgeOperations
 from graphiti_core.driver.query_executor import QueryExecutor, Transaction
 from graphiti_core.driver.record_parsers import entity_edge_from_record
 from graphiti_core.edges import EntityEdge
+from graphiti_core.driver.falkordb.operations.entity_node_ops import _sanitize_for_falkordb
 from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.models.edges.edge_db_queries import (
     get_entity_edge_return_query,
@@ -54,6 +55,7 @@ class FalkorEntityEdgeOperations(EntityEdgeOperations):
             'invalid_at': edge.invalid_at,
         }
         edge_data.update(edge.attributes or {})
+        edge_data = _sanitize_for_falkordb(edge_data)
 
         query = get_entity_edge_save_query(GraphProvider.FALKORDB)
         if tx is not None:
@@ -87,7 +89,7 @@ class FalkorEntityEdgeOperations(EntityEdgeOperations):
                 'invalid_at': edge.invalid_at,
             }
             edge_data.update(edge.attributes or {})
-            prepared.append(edge_data)
+            prepared.append(_sanitize_for_falkordb(edge_data))
 
         query = get_entity_edge_save_bulk_query(GraphProvider.FALKORDB)
         if tx is not None:
