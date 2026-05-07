@@ -54,13 +54,18 @@ class OpenAIEmbedder(EmbedderClient):
     async def create(
         self, input_data: str | list[str] | Iterable[int] | Iterable[Iterable[int]]
     ) -> list[float]:
+        # Guard against empty strings which the embedding API rejects
+        if isinstance(input_data, str) and not input_data.strip():
+            return [0.0] * self.config.embedding_dim
         result = await self.client.embeddings.create(
             input=input_data, model=self.config.embedding_model
         )
         return result.data[0].embedding[: self.config.embedding_dim]
 
     async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
+        # Replace empty strings with a placeholder to avoid API rejection
+        sanitized = [s if s.strip() else " " for s in input_data_list]
         result = await self.client.embeddings.create(
-            input=input_data_list, model=self.config.embedding_model
+            input=sanitized, model=self.config.embedding_model
         )
         return [embedding.embedding[: self.config.embedding_dim] for embedding in result.data]
